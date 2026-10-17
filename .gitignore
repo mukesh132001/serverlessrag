@@ -1,0 +1,22 @@
+# Built at deploy time
+lambda_layer/
+lambda_ingest/common/
+lambda_chat/common/
+
+# Node / CDK
+infrastructure/node_modules/
+infrastructure/cdk.out/
+infrastructure/*.js
+infrastructure/**/*.js
+infrastructure/**/*.d.ts
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Evaluation outputs
+eval/results/
+
+.DS_Store

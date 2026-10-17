@@ -99,45 +99,18 @@ def _execute_psycopg2(connection, query: str, params: Tuple = None, fetch: bool 
             return []
 
 def _execute_pg8000(connection, query: str, params: Tuple = None, fetch: bool = False):
-    """Execute query using pg8000"""
-    try:
-        # pg8000 uses positional parameters differently - need to convert %s to named or use direct substitution
-        if params:
-            # Convert %s to positional parameters for pg8000
-            # Replace %s with :1, :2, etc.
-            param_count = query.count('%s')
-            if param_count > 0:
-                for i in range(param_count):
-                    query = query.replace('%s', f':{i+1}', 1)
-                
-                # Create named parameter dict
-                param_dict = {str(i+1): params[i] for i in range(len(params))}
-                result = connection.run(query, **param_dict)
-            else:
-                result = connection.run(query)
-        else:
-            result = connection.run(query)
-        
-        if fetch:
-            return result if result else []
-        else:
-            return []
-    except Exception as e:
-        logger.error(f"pg8000 query execution failed: {e}")
-        # Fallback - try with string formatting (less safe but might work)
-        try:
-            if params and '%s' in query:
-                # Simple string substitution as last resort
-                formatted_query = query % params
-                result = connection.run(formatted_query)
-                if fetch:
-                    return result if result else []
-                else:
-                    return []
-        except Exception as e2:
-            logger.error(f"pg8000 fallback execution also failed: {e2}")
-        
-        raise e
+    """Execute query using pg8000, converting %s placeholders to :1, :2, ...
+
+    Parameters are always passed separately to the driver; values are never
+    formatted into the SQL string.
+    """
+    if params:
+        for i in range(query.count('%s')):
+            query = query.replace('%s', f':{i + 1}', 1)
+        result = connection.run(query, **{str(i + 1): v for i, v in enumerate(params)})
+    else:
+        result = connection.run(query)
+    return (result or []) if fetch else []
 
 def get_db_credentials() -> Tuple[str, str, str, str, str]:
     """Get database credentials from environment or Secrets Manager"""
@@ -198,72 +171,56 @@ def test_connection():
         logger.error(f"Database test failed: {e}")
         return False
 
+SCHEMA_STATEMENTS = [
+    "CREATE EXTENSION IF NOT EXISTS vector",
+    """
+    CREATE TABLE IF NOT EXISTS topics (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) UNIQUE NOT NULL,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS papers (
+        id SERIAL PRIMARY KEY,
+        arxiv_id VARCHAR(50) UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        authors TEXT,
+        abstract TEXT,
+        published_date DATE,
+        categories TEXT,
+        topic_id INTEGER REFERENCES topics(id),
+        embedding VECTOR(1024),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    # IVFFlat clusters are trained on the rows present at build time, so an
+    # IVFFlat index created on an empty table gives poor recall. HNSW needs no
+    # training and stays accurate as papers are added.
+    "DROP INDEX IF EXISTS papers_embedding_idx",
+    """
+    CREATE INDEX IF NOT EXISTS papers_embedding_hnsw_idx
+    ON papers USING hnsw (embedding vector_cosine_ops)
+    """,
+    "CREATE INDEX IF NOT EXISTS papers_topic_id_idx ON papers (topic_id)",
+]
+
+
 def initialize_database():
-    """Initialize database schema if it doesn't exist"""
-    try:
-        # Test connection first
-        if not test_connection():
-            raise Exception("Database connection test failed")
-        
-        # Check if papers table exists
-        check_query = """
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public' AND table_name = 'papers'
-        """
-        
-        result = execute_query(check_query, fetch=True)
-        
-        if not result:
-            logger.info("Creating database schema...")
-            
-            # Enable vector extension
-            execute_query("CREATE EXTENSION IF NOT EXISTS vector")
-            
-            # Create topics table
-            create_topics_query = """
-            CREATE TABLE IF NOT EXISTS topics (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(255) UNIQUE NOT NULL,
-                description TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-            
-            # Create papers table with vector column
-            create_papers_query = """
-            CREATE TABLE IF NOT EXISTS papers (
-                id SERIAL PRIMARY KEY,
-                arxiv_id VARCHAR(50) UNIQUE NOT NULL,
-                title TEXT NOT NULL,
-                authors TEXT,
-                abstract TEXT,
-                published_date DATE,
-                categories TEXT,
-                topic_id INTEGER REFERENCES topics(id),
-                embedding VECTOR(1024),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-            
-            execute_query(create_topics_query)
-            execute_query(create_papers_query)
-            
-            # Create index for vector similarity search
-            create_index_query = """
-            CREATE INDEX IF NOT EXISTS papers_embedding_idx 
-            ON papers USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 100)
-            """
-            execute_query(create_index_query)
-            
-            logger.info("Database schema created successfully")
-        else:
-            logger.info("Database schema already exists")
-            
-    except Exception as e:
-        logger.error(f"Error initializing database: {e}")
-        raise
+    """Create the schema and indexes if they don't exist (safe to re-run)."""
+    if not test_connection():
+        raise Exception("Database connection test failed")
+    for statement in SCHEMA_STATEMENTS:
+        execute_query(statement)
+    logger.info("Database schema verified")
+
+
+def to_pgvector(embedding) -> str:
+    """Format an embedding as a pgvector literal, e.g. '[0.1,0.2]'."""
+    values = embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)
+    return '[' + ','.join(map(str, values)) + ']'
+
 
 def get_or_create_topic(name: str, description: str = None) -> int:
     """Get existing topic ID or create new topic"""
@@ -320,13 +277,8 @@ def insert_paper(paper: dict, topic_id: int) -> int:
         # Generate embeddings for the paper
         text_content = f"{paper['title']}\n\n{paper['abstract']}"
         
-        # Import here to avoid circular imports
-        try:
-            from bedrock_utils import generate_embeddings
-        except ImportError:
-            # Try relative import for Lambda
-            from .bedrock_utils import generate_embeddings
-            
+        from .bedrock_utils import generate_embeddings
+
         embeddings = generate_embeddings([text_content])
         
         if not embeddings:
@@ -340,15 +292,7 @@ def insert_paper(paper: dict, topic_id: int) -> int:
         RETURNING id
         """
         
-        # Format embedding as PostgreSQL vector format
-        embedding = embeddings[0]
-        if hasattr(embedding, 'tolist'):
-            embedding_list = embedding.tolist()
-        else:
-            embedding_list = list(embedding)
-        
-        # Convert to PostgreSQL vector format with square brackets
-        embedding_str = '[' + ','.join(map(str, embedding_list)) + ']'
+        embedding_str = to_pgvector(embeddings[0])
         
         values = (
             paper['arxiv_id'],

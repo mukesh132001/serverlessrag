@@ -1,266 +1,187 @@
-import json
+"""Chat Lambda: embed the question, retrieve similar papers, answer with sources."""
 import logging
-import os
-import sys
-from typing import Dict, Any, List
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-# Configure SSL certificates BEFORE any boto3 imports
-# Use system CA bundle instead of certifi
-ca_bundle_paths = [
-    '/etc/pki/tls/certs/ca-bundle.crt',  # Amazon Linux
-    '/etc/ssl/certs/ca-certificates.crt',  # Debian/Ubuntu
-    '/etc/ssl/ca-bundle.pem',  # OpenSUSE
-]
+from common.bedrock_utils import generate_chat_response, generate_embeddings
+from common.db_utils import execute_query, to_pgvector
+from common.http_utils import BadRequest, clamp_int, parse_body, require_text, response, server_error
 
-for ca_path in ca_bundle_paths:
-    if os.path.exists(ca_path):
-        os.environ['AWS_CA_BUNDLE'] = ca_path
-        os.environ['REQUESTS_CA_BUNDLE'] = ca_path
-        break
-
-# Set up logging first
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Import common utilities - add paths for Lambda runtime
-sys.path.insert(0, '/opt/python')  # Lambda layer path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.insert(0, parent_dir)
+MAX_QUERY_CHARS = 1000
+MAX_TOP_K = 20
+NO_RESULTS_MESSAGE = "I could not find relevant information to answer your query."
 
-try:
-    import boto3
-    from common.db_utils import get_connection, execute_query, test_connection
-    from common.bedrock_utils import generate_embeddings, generate_chat_response
-except ImportError as e:
-    logger.error(f"Import error: {e}")
-    raise
-logger.setLevel(logging.INFO)
 
 def main(event, context):
     """
-    Lambda handler for chat functionality with RAG
-    
-    Expected event format:
+    POST /chat
     {
-        "query": "What are the latest developments in quantum computing?",
-        "topic_id": 1,
-        "top_k": 5
+        "query": "What are recent advances in quantum error correction?",
+        "topic": "Quantum Computing",   # optional; or "topic_id"
+        "top_k": 5,                     # optional, 1-20
+        "retrieval_only": false         # optional; skip the LLM call (used by evaluation)
     }
     """
+    started = time.perf_counter()
     try:
-        # Parse request
-        body = json.loads(event.get('body', '{}'))
-        user_query = body.get('query', '')
-        topic_id = body.get('topic_id')
-        topic_name = body.get('topic')  # Allow topic name instead of ID
-        top_k = body.get('top_k', 5)
-        
-        if not user_query:
-            return {
-                'statusCode': 400,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
-                    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-                },
-                'body': json.dumps({'error': 'Query is required'})
-            }
-        
-        # If topic name is provided, convert to topic_id
-        if topic_name and not topic_id:
-            topic_id = get_topic_id_by_name(topic_name)
-        
-        logger.info(f"Processing chat query: {user_query}, topic_id: {topic_id}")
-        
-        # Generate embedding for the user query
-        query_embeddings = generate_embeddings([user_query])
-        query_embedding = query_embeddings[0]
-        
-        # Search for relevant chunks
-        relevant_chunks = search_relevant_chunks(
-            query_embedding, 
-            topic_id=topic_id, 
-            top_k=top_k
-        )
-        
-        if not relevant_chunks:
-            return {
-                'statusCode': 200,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
-                    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-                },
-                'body': json.dumps({
-                    'response': 'I could not find relevant information to answer your query.',
-                    'sources': []
-                })
-            }
-        
-        # Prepare context from relevant chunks
-        context = prepare_context(relevant_chunks)
-        
-        # Generate response using Claude
-        response = generate_response_with_context(user_query, context)
-        
-        # Prepare sources for citation
+        body = parse_body(event)
+        user_query = require_text(body.get("query"), "query", MAX_QUERY_CHARS)
+        top_k = clamp_int(body.get("top_k"), default=5, low=1, high=MAX_TOP_K, name="top_k")
+        retrieval_only = bool(body.get("retrieval_only", False))
+
+        topic_id = body.get("topic_id")
+        if topic_id is not None:
+            topic_id = clamp_int(topic_id, default=None, low=1, high=2**31 - 1, name="topic_id")
+        elif body.get("topic"):
+            topic_id = get_topic_id_by_name(require_text(body["topic"], "topic", 255))
+            if topic_id is None:
+                return response(404, {"error": f"Topic '{body['topic']}' not found"})
+    except BadRequest as e:
+        return response(400, {"error": str(e)})
+    except Exception:
+        logger.exception("Error validating chat request")
+        return server_error(context)
+
+    try:
+        timings: Dict[str, float] = {}
+
+        t = time.perf_counter()
+        query_embedding = generate_embeddings([user_query])[0]
+        timings["embedding_ms"] = _ms_since(t)
+
+        t = time.perf_counter()
+        papers = search_similar_papers(query_embedding, topic_id=topic_id, top_k=top_k)
+        timings["retrieval_ms"] = _ms_since(t)
+
         sources = [
             {
-                'paper_title': chunk['paper_title'],
-                'arxiv_id': chunk['arxiv_id'],
-                'similarity': round(chunk['similarity'], 3),
-                'url': chunk['url']
+                "paper_title": p["paper_title"],
+                "arxiv_id": p["arxiv_id"],
+                "similarity": round(p["similarity"], 4),
+                "url": p["url"],
             }
-            for chunk in relevant_chunks
+            for p in papers
         ]
-        
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
-                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-            },
-            'body': json.dumps({
-                'response': response,
-                'sources': sources,
-                'context_chunks': len(relevant_chunks)
-            })
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in chat handler: {e}")
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
-                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-            },
-            'body': json.dumps({'error': str(e)})
-        }
 
-def search_relevant_chunks(query_embedding: List[float], topic_id: int = None, top_k: int = 5) -> List[Dict[str, Any]]:
-    """Search for relevant papers using vector similarity"""
-    try:
-        # Convert embedding to PostgreSQL vector format
-        if hasattr(query_embedding, 'tolist'):
-            embedding_list = query_embedding.tolist()
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        if not papers:
+            answer = NO_RESULTS_MESSAGE
+        elif retrieval_only:
+            answer = None
         else:
-            embedding_list = list(query_embedding)
-        
-        # Format as PostgreSQL vector with square brackets
-        embedding_str = '[' + ','.join(map(str, embedding_list)) + ']'
-        
-        # Build query with optional topic filter
-        base_query = """
-            SELECT 
-                p.abstract as content,
-                p.embedding <=> %s::vector as similarity,
-                p.title as paper_title,
-                p.arxiv_id
-            FROM papers p
-        """
-        
-        params = [embedding_str]
-        
-        if topic_id:
-            base_query += " WHERE p.topic_id = %s"
-            params.append(topic_id)
-        
-        base_query += """
-            ORDER BY p.embedding <=> %s::vector
-            LIMIT %s
-        """
-        params.extend([embedding_str, top_k])
-        
-        results = execute_query(base_query, params, fetch=True)
-        
-        # Convert to list of dictionaries
-        chunks = []
-        for result in results:
-            if isinstance(result, dict):
-                chunk_data = {
-                    'content': result['content'],
-                    'similarity': float(result['similarity']),
-                    'paper_title': result['paper_title'],
-                    'arxiv_id': result['arxiv_id'],
-                    'url': f"https://arxiv.org/abs/{result['arxiv_id']}"
-                }
-            else:
-                # Handle tuple result
-                chunk_data = {
-                    'content': result[0],
-                    'similarity': float(result[1]),
-                    'paper_title': result[2],
-                    'arxiv_id': result[3],
-                    'url': f"https://arxiv.org/abs/{result[3]}"
-                }
-            chunks.append(chunk_data)
-        
-        logger.info(f"Found {len(chunks)} relevant papers for query")
-        return chunks
-        
-    except Exception as e:
-        logger.error(f"Error searching for chunks: {e}")
-        return []
+            t = time.perf_counter()
+            answer, usage = generate_answer(user_query, build_context(papers))
+            timings["generation_ms"] = _ms_since(t)
 
-def prepare_context(chunks: List[Dict[str, Any]]) -> str:
-    """Prepare context string from relevant chunks"""
-    context_parts = []
-    
-    for i, chunk in enumerate(chunks, 1):
-        context_parts.append(
-            f"[Source {i}: {chunk['paper_title']} (arXiv:{chunk['arxiv_id']})]\n"
-            f"{chunk['content']}\n"
-        )
-    
-    return "\\n".join(context_parts)
+        timings["total_ms"] = _ms_since(started)
+        logger.info("chat ok top_k=%s sources=%s timings=%s usage=%s", top_k, len(sources), timings, usage)
 
-def generate_response_with_context(user_query: str, context: str) -> str:
-    """Generate response using Claude with retrieved context"""
-    try:
-        messages = [
-            {
-                "role": "user",
-                "content": f"""Based on the following research paper excerpts, please answer this question: {user_query}
+        return response(200, {
+            "response": answer,
+            "sources": sources,
+            "num_sources": len(sources),
+            "timings_ms": timings,
+            "usage": usage,
+        })
+    except Exception:
+        logger.exception("Error in chat handler")
+        return server_error(context)
 
-Research Context:
-{context}
 
-Please provide a comprehensive answer based on the information in these sources."""
-            }
-        ]
-        
-        response = generate_chat_response(messages)
-        return response
-        
-    except Exception as e:
-        logger.error(f"Error generating response: {e}")
-        return f"Error details: {str(e)}"
+def build_search_query(topic_id: Optional[int]) -> str:
+    """SQL for nearest-neighbour search.
 
-def get_topic_id_by_name(topic_name: str) -> int:
-    """Get topic ID by topic name"""
-    try:
-        query = "SELECT id FROM topics WHERE name = %s"
-        result = execute_query(query, (topic_name,), fetch=True)
-        
-        if result and len(result) > 0:
-            if isinstance(result[0], dict):
-                return result[0]['id']
-            elif isinstance(result[0], (list, tuple)):
-                return result[0][0]
-            else:
-                return result[0]
-        else:
-            logger.warning(f"Topic '{topic_name}' not found")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Error looking up topic: {e}")
+    pgvector's <=> operator returns cosine DISTANCE (0 = identical, 2 = opposite),
+    so similarity is reported as 1 - distance and results are ordered by distance.
+    """
+    where = "WHERE p.topic_id = %s" if topic_id else ""
+    return f"""
+        SELECT
+            p.abstract AS content,
+            1 - (p.embedding <=> %s::vector) AS similarity,
+            p.title AS paper_title,
+            p.arxiv_id
+        FROM papers p
+        {where}
+        ORDER BY p.embedding <=> %s::vector
+        LIMIT %s
+    """
+
+
+def build_search_params(embedding_str: str, topic_id: Optional[int], top_k: int) -> Tuple:
+    params: List[Any] = [embedding_str]
+    if topic_id:
+        params.append(topic_id)
+    params.extend([embedding_str, top_k])
+    return tuple(params)
+
+
+def row_to_paper(row: Any) -> Dict[str, Any]:
+    """Normalize a result row from psycopg2 (dict) or pg8000 (list/tuple)."""
+    if isinstance(row, dict):
+        content, similarity, title, arxiv_id = row["content"], row["similarity"], row["paper_title"], row["arxiv_id"]
+    else:
+        content, similarity, title, arxiv_id = row[0], row[1], row[2], row[3]
+    return {
+        "content": content,
+        "similarity": float(similarity),
+        "paper_title": title,
+        "arxiv_id": arxiv_id,
+        "url": f"https://arxiv.org/abs/{arxiv_id}",
+    }
+
+
+def search_similar_papers(query_embedding, topic_id: Optional[int] = None, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Return the top_k most similar papers (one title+abstract embedding per paper)."""
+    embedding_str = to_pgvector(query_embedding)
+    rows = execute_query(
+        build_search_query(topic_id),
+        build_search_params(embedding_str, topic_id, top_k),
+        fetch=True,
+    )
+    return [row_to_paper(r) for r in rows]
+
+
+def build_context(papers: List[Dict[str, Any]]) -> str:
+    """Numbered source blocks the model can cite as [Source N]."""
+    return "\n\n".join(
+        f"[Source {i}: {p['paper_title']} (arXiv:{p['arxiv_id']})]\n{p['content']}"
+        for i, p in enumerate(papers, 1)
+    )
+
+
+def build_messages(user_query: str, context: str) -> List[Dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You answer questions about research papers using only the provided sources. "
+                "Cite sources as [Source N]. If the sources do not contain the answer, say so."
+            ),
+        },
+        {"role": "user", "content": f"Sources:\n{context}\n\nQuestion: {user_query}"},
+    ]
+
+
+def generate_answer(user_query: str, context: str) -> Tuple[str, Dict[str, int]]:
+    """Generate a grounded answer with the gpt-oss model on Bedrock."""
+    return generate_chat_response(build_messages(user_query, context))
+
+
+def get_topic_id_by_name(topic_name: str) -> Optional[int]:
+    rows = execute_query("SELECT id FROM topics WHERE name = %s", (topic_name,), fetch=True)
+    if not rows:
         return None
+    row = rows[0]
+    if isinstance(row, dict):
+        return row["id"]
+    if isinstance(row, (list, tuple)):
+        return row[0]
+    return row
+
+
+def _ms_since(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 1)

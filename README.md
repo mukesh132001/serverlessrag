@@ -1,306 +1,178 @@
-# Serverless RAG Research System
+# Serverless RAG Research Assistant
 
-## Overview
-
-A complete serverless research paper ingestion and search system built on AWS. The system fetches papers from arXiv, generates embeddings using Amazon Titan, stores them in PostgreSQL with pgvector, and provides semantic search with AI-powered chat responses using OpenAI models via AWS Bedrock.
+A serverless retrieval-augmented generation (RAG) system on AWS for searching and asking questions about arXiv research papers. Papers are fetched from the arXiv API, embedded with Amazon Titan Text Embeddings v2, stored in Aurora PostgreSQL with pgvector, and answered by an OpenAI gpt-oss model on Amazon Bedrock with source citations. All infrastructure is defined in AWS CDK (TypeScript).
 
 ## Architecture
 
-- **API Gateway** - REST endpoints for ingestion and chat
-- **AWS Lambda** - Serverless compute for paper processing and chat
-- **Amazon Bedrock** - AI services (Titan embeddings + OpenAI chat models)
-- **Aurora PostgreSQL** - Vector database with pgvector extension
-- **AWS CDK** - Infrastructure as code
-
-## Features
-
-- **Paper Ingestion** - Fetch and process papers from arXiv API
-- **Vector Embeddings** - Amazon Titan Text Embeddings v2 (1024 dimensions)
-- **Semantic Search** - pgvector-powered similarity search
-- **AI Chat** - OpenAI GPT models via Bedrock for intelligent responses
-- **Topic Management** - Automatic topic categorization and management
-- **Deduplication** - Prevents duplicate paper storage
-- **Serverless** - Fully managed, auto-scaling infrastructure
-
-## Project Structure
-
-```
-├── infrastructure/          # AWS CDK infrastructure code
-│   ├── lib/
-│   │   └── serverless-rag-stack.ts
-│   ├── bin/
-│   │   └── app.ts
-│   └── package.json
-├── lambda_ingest/          # Paper ingestion Lambda function
-│   ├── handler.py
-│   ├── requirements.txt
-│   └── common/
-│       ├── bedrock_utils.py
-│       └── db_utils.py
-├── lambda_chat/           # Chat/search Lambda function
-│   ├── handler.py
-│   ├── requirements.txt
-│   └── common/
-│       ├── bedrock_utils.py
-│       └── db_utils.py
-├── chat_ui/               # Web interface
-│   ├── index.html
-│   ├── style.css
-│   ├── script.js
-│   └── README.md
-├── lambda_layer/          # Python dependencies layer
-│   └── python/
-├── common/               # Shared utilities
-│   ├── bedrock_utils.py  # AI services integration
-│   └── db_utils.py       # Database operations
-└── AWS_DEPLOYMENT_GUIDE.md
+```mermaid
+flowchart LR
+    UI[Chat UI<br/>EC2 + Apache] -->|POST /ingest, /chat| APIGW[API Gateway<br/>throttled]
+    APIGW --> ING[Ingest Lambda]
+    APIGW --> CHAT[Chat Lambda]
+    ING -->|fetch papers| ARXIV[(arXiv API)]
+    ING -->|embed| TITAN[Bedrock<br/>Titan Embeddings v2]
+    CHAT -->|embed query| TITAN
+    CHAT -->|grounded answer| GPT[Bedrock<br/>gpt-oss-20b]
+    ING --> DB[(Aurora PostgreSQL<br/>Serverless v2 + pgvector)]
+    CHAT -->|HNSW cosine search| DB
+    SM[Secrets Manager] -.credentials.-> ING
+    SM -.credentials.-> CHAT
 ```
 
-## Setup & Deployment
+- **Network:** VPC with public, private (Lambdas, egress via NAT), and isolated (database) subnets. The database accepts connections only from the Lambda security group.
+- **Ingestion:** fetches papers from arXiv, deduplicates by arXiv ID, embeds title + abstract (1024 dimensions, normalized), and stores one vector per paper.
+- **Retrieval:** cosine nearest-neighbour search over an HNSW index, optionally filtered by topic. Similarity is reported as `1 − cosine distance`.
+- **Generation:** the top results are passed to gpt-oss-20b with instructions to answer only from the sources and cite them as `[Source N]`.
+- **Observability:** each chat response includes per-stage timings (embedding, retrieval, generation) and token usage; Lambda logs go to CloudWatch.
 
-### Prerequisites
+## Repository layout
 
-1. **AWS Account** with appropriate permissions
-2. **Node.js** (v18+) for CDK
-3. **Python** (3.11+) for Lambda functions
-4. **AWS CLI** configured with credentials
+```
+common/            Shared Python code (Bedrock, database, HTTP helpers), copied into each Lambda at synth time
+lambda_ingest/     POST /ingest handler
+lambda_chat/       POST /chat handler
+infrastructure/    AWS CDK stack (TypeScript)
+chat_ui/           Static web interface
+eval/              Retrieval evaluation (metrics, runner, eval-set template)
+tests/             Unit tests (run offline, no AWS needed)
+scripts/           Lambda layer build script
+```
 
-### Quick Deploy
+## Deploy
 
-1. **Clone and install dependencies:**
+Prerequisites: an AWS account with Bedrock access to `amazon.titan-embed-text-v2:0` and `openai.gpt-oss-20b-1:0` in your region, the AWS CLI configured, Node.js 18+, and Python 3.11+.
+
 ```bash
-git clone <repository-url>
-cd Custom-Research/infrastructure
-npm install
+git clone https://gitlab.com/mukeshethiraj0/serverlessrag.git
+cd serverlessrag
+./deploy.sh
 ```
 
-2. **Deploy the infrastructure:**
+`deploy.sh` builds the Lambda dependency layer, installs CDK dependencies, bootstraps CDK, deploys the stack, and prints the API and Chat UI URLs.
+
+Optional settings are passed as CDK context:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `allowedOrigin` | `*` | CORS origin, e.g. your Chat UI URL |
+| `throttleRate` / `throttleBurst` | `5` / `10` | API Gateway requests per second and burst |
+| `uiRepoUrl` | this repo | Git repo the Chat UI instance clones |
+
 ```bash
-cdk deploy --require-approval never
+./deploy.sh -c allowedOrigin=http://ec2-1-2-3-4.compute-1.amazonaws.com
 ```
 
-3. **Access the deployed system:**
-```
-Outputs:
-ServerlessRagStack.ApiEndpoint = https://xxxxx.execute-api.us-east-1.amazonaws.com/prod/
-ServerlessRagStack.ChatUIUrl = http://ec2-xxx-xxx-xxx-xxx.compute-1.amazonaws.com
-ServerlessRagStack.ChatUIInstanceId = i-1234567890abcdef0
-```
+**Cost note:** Aurora Serverless v2 and the NAT gateway bill while the stack is running. Destroy it when you're done:
 
-The Chat UI will be automatically deployed and configured with your API endpoint.
-
-4. **Optional - Local Development:**
 ```bash
-cd chat_ui
-python -m http.server 8000
-# Then manually configure the API endpoint in the UI
+cd infrastructure && npx cdk destroy ServerlessRagStack
 ```
 
-## Usage
+Shell access to the UI instance is through AWS Systems Manager Session Manager; no SSH port is open.
 
-### Web Interface (Recommended)
+## API
 
-The system includes a hosted web interface that's automatically deployed:
+### `POST /ingest`
 
-1. **Access the web interface** using the ChatUIUrl from deployment outputs
-2. **Start using immediately** - the API endpoint is pre-configured
-3. **Ingest papers** on topics of interest
-4. **Chat** with the AI about your research papers
-
-### Local Web Interface
-
-For development or customization:
-
-1. Open `chat_ui/index.html` in your browser
-2. Configure your API endpoint URL
-3. Ingest papers on topics of interest
-4. Chat with the AI about your research papers
-
-### API Endpoints
-
-The system provides REST API endpoints for paper ingestion and semantic search. Use any HTTP client or build your own interface.
-
-### Direct API Usage
-
-#### 1. Ingest Papers
 ```bash
-curl -X POST "https://your-api-endpoint/prod/ingest" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "quantum computing",
-    "max_papers": 10
-  }'
+curl -X POST "$API/ingest" -H "Content-Type: application/json" \
+  -d '{"query": "retrieval augmented generation", "max_results": 20, "topic_name": "RAG"}'
 ```
 
-**Response:**
+| Field | Required | Notes |
+| --- | --- | --- |
+| `query` | yes | arXiv search terms |
+| `max_results` | no | 1–50, default 10 |
+| `topic_name` | no | defaults to the query in title case |
+
+Returns `inserted_count`, `skipped_duplicates`, `failed_count`, `elapsed_ms`, and the list of fetched papers.
+
+### `POST /chat`
+
+```bash
+curl -X POST "$API/chat" -H "Content-Type: application/json" \
+  -d '{"query": "How does retrieval reduce hallucination?", "topic": "RAG", "top_k": 5}'
+```
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `query` | yes | up to 1000 characters |
+| `topic` or `topic_id` | no | restricts search to one topic |
+| `top_k` | no | 1–20, default 5 |
+| `retrieval_only` | no | `true` skips the LLM call (used for evaluation) |
+
 ```json
 {
-  "message": "Successfully processed 10 papers",
-  "total_papers_fetched": 10,
-  "processed_count": 10,
-  "database_enabled": true,
-  "topic": "Quantum Computing",
-  "papers": [...]
-}
-```
-
-#### 2. Chat/Search
-```bash
-curl -X POST "https://your-api-endpoint/prod/chat" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "what are quantum algorithms?",
-    "topic": "Quantum Computing",
-    "top_k": 5
-  }'
-```
-
-**Response:**
-```json
-{
-  "response": "Quantum algorithms are computational procedures...",
+  "response": "Retrieval grounds the model in source text ... [Source 1]",
   "sources": [
-    {
-      "paper_title": "Quantum Algorithm Design",
-      "arxiv_id": "2301.12345",
-      "similarity": 0.89,
-      "url": "https://arxiv.org/abs/2301.12345"
-    }
+    {"paper_title": "...", "arxiv_id": "2005.11401v4", "similarity": 0.6123, "url": "https://arxiv.org/abs/2005.11401v4"}
   ],
-  "context_chunks": 5
+  "num_sources": 5,
+  "timings_ms": {"embedding_ms": 85.2, "retrieval_ms": 9.8, "generation_ms": 2140.5, "total_ms": 2241.7},
+  "usage": {"prompt_tokens": 1450, "completion_tokens": 210}
 }
 ```
 
-## Configuration
+Errors return a generic message and the Lambda request ID; details are logged to CloudWatch only.
 
-### Building Custom Interfaces
+## Evaluation
 
-You can build custom interfaces using the API endpoints:
+Retrieval quality is measured against a hand-labeled question set.
 
-```python
-import requests
+1. **Ingest papers** for a few topics and save the responses:
+   ```bash
+   curl -s -X POST "$API/ingest" -H "Content-Type: application/json" \
+     -d '{"query": "retrieval augmented generation", "max_results": 20, "topic_name": "RAG"}' > eval/ingest_rag.json
+   ```
+2. **Build a template** with one row per ingested paper:
+   ```bash
+   python eval/make_eval_template.py eval/ingest_*.json -o eval/eval_set.jsonl
+   ```
+3. **Write one question per paper** in the `question` field. Describe what the paper does in your own words; don't copy phrases from the title, or the test becomes keyword matching. Aim for 30–50 questions.
+4. **Run the evaluation:**
+   ```bash
+   # Retrieval quality (no LLM calls)
+   python eval/run_eval.py --api "$API" --eval-set eval/eval_set.jsonl --mode retrieval
 
-# Ingest papers
-response = requests.post(
-    "https://your-api-endpoint/prod/ingest",
-    json={"query": "quantum computing", "max_papers": 5}
-)
+   # Harder: search across all topics
+   python eval/run_eval.py --api "$API" --eval-set eval/eval_set.jsonl --mode retrieval --ignore-topic
 
-# Search and chat
-response = requests.post(
-    "https://your-api-endpoint/prod/chat",
-    json={"query": "what are quantum algorithms?", "topic": "Quantum Computing"}
-)
-```
+   # End-to-end latency, tokens, and LLM cost (prices in USD per 1K tokens from the Bedrock pricing page)
+   python eval/run_eval.py --api "$API" --eval-set eval/eval_set.jsonl --mode full \
+     --input-price <input_price> --output-price <output_price>
+   ```
 
-### Environment Variables (Lambda)
-- `DB_SECRET_ARN` - RDS secret ARN (auto-configured)
-- `DB_CLUSTER_ARN` - Aurora cluster ARN (auto-configured)
-- `REGION` - AWS region (auto-configured)
+The runner reports hit rate@1/3/5, MRR@5, recall@5, client and server latency (p50/p95), average token usage, and LLM cost per query, and writes JSON and Markdown reports to `eval/results/`. It uses only the Python standard library.
 
-### Models Used
-- **Embeddings:** `amazon.titan-embed-text-v2:0` (1024 dimensions)
-- **Chat:** `openai.gpt-oss-20b-1:0` (OpenAI model via Bedrock)
+### Results
 
-## Database Schema
+_Run the evaluation and record the numbers here._
 
-### Topics Table
-```sql
-CREATE TABLE topics (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(255) UNIQUE NOT NULL,
-    description TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+| Metric | Topic-filtered | All topics |
+| --- | --- | --- |
+| Questions | | |
+| Hit rate@1 | | |
+| Hit rate@5 | | |
+| MRR@5 | | |
+| Retrieval latency p95 (server) | | |
+| End-to-end latency p50 / p95 | | |
+| LLM cost per query | | |
 
-### Papers Table
-```sql
-CREATE TABLE papers (
-    id SERIAL PRIMARY KEY,
-    arxiv_id VARCHAR(50) UNIQUE NOT NULL,
-    title TEXT NOT NULL,
-    authors TEXT,
-    abstract TEXT,
-    published_date DATE,
-    categories TEXT,
-    topic_id INTEGER REFERENCES topics(id),
-    embedding VECTOR(1024),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-## Security & Permissions
-
-The system uses least-privilege IAM roles with permissions for:
-- Bedrock model invocation (Titan embeddings + OpenAI chat)
-- RDS cluster access via IAM database authentication
-- Secrets Manager for database credentials
-- VPC access for Lambda functions
-
-## Cost Optimization
-
-- **Lambda** - Pay per invocation, cold start optimized
-- **API Gateway** - Pay per request
-- **Aurora Serverless** - Auto-scaling database, pay for what you use
-- **Bedrock** - Pay per token for embeddings and chat
-
-## Monitoring
-
-- CloudWatch logs for Lambda functions
-- Bedrock usage metrics
-- API Gateway metrics and access logs
-- Aurora performance insights
-
-## Troubleshooting
-
-### Common Issues
-
-1. **"Model not available"** - Ensure Bedrock models are enabled in your region
-2. **Database connection errors** - Check VPC configuration and security groups
-3. **Cold start timeouts** - Increase Lambda timeout for large paper batches
-4. **Out of memory** - Increase Lambda memory for embedding generation
-
-### Debug Commands
+## Tests
 
 ```bash
-# Check Lambda logs
-aws logs tail "/aws/lambda/ServerlessRagStack-IngestFunction..." --follow
-
-# Test database connectivity
-aws rds describe-db-clusters --db-cluster-identifier your-cluster-name
-
-# Verify Bedrock model access
-aws bedrock list-foundation-models --query 'modelSummaries[?contains(modelId, `titan`)]'
+pip install -r requirements-dev.txt
+pytest -q
 ```
 
-## Cleanup
+The tests run offline with the AWS SDK stubbed. They cover arXiv parsing, input validation, the similarity calculation, context building, deduplication, error handling, parameter binding, and the evaluation metrics.
 
-To avoid ongoing costs, destroy the infrastructure when done:
+## Design notes and limitations
 
-```bash
-cd infrastructure
-cdk destroy
-```
+- **One vector per paper.** Retrieval is at the title + abstract level, which suits finding the right paper. Answers about details inside a paper's full text would need PDF chunking.
+- **HNSW over IVFFlat.** IVFFlat learns its clusters from the rows present when the index is built, so building it on an empty table gives poor recall. HNSW needs no training and stays accurate as papers are added.
+- **Security.** The API has no authentication and relies on stage throttling; add an API key with a usage plan, or Cognito, before sharing it publicly. The Chat UI is served over HTTP; put CloudFront with HTTPS in front for production.
 
-## Future Enhancements
+## License
 
-- [ ] Multi-modal embeddings for figures and equations
-- [ ] Real-time paper notifications
-- [ ] Advanced query parsing and filters
-- [ ] Paper recommendation system
-- [ ] Collaboration features
-- [ ] Citation network analysis
-
-## Cost Comparison Table
-
-| Component                         | **Your AWS RAG System**                        | **ChatGPT Research Mode**                          |
-| --------------------------------- | ---------------------------------------------- | -------------------------------------------------- |
-| **Embedding cost**                | $0.0001–$0.0004 per 1K tokens (Titan v2)       | Included in subscription (no transparency)         |
-| **Vector DB retrieval**           | $0.000005–$0.00003                             | Included                                           |
-| **LLM inference**                 | $0.0004–$0.02 per 1K tokens (depends on model) | Included (but runs expensive GPT-4/5-level models) |
-| **API Gateway**                   | $0.000002 per request                          | N/A                                                |
-| **Lambda execution**              | $0.00002–$0.00008 per request                  | N/A                                                |
-| **EC2 hosting UI**                | Fixed cost ~$9/month                           | Included                                           |
-| **TOTAL per request (realistic)** | **$0.002 – $0.015 per query**                  | **~$0.04 – $0.12 per query (hidden cost)**         |
-Uploaded by Mukesh
+MIT

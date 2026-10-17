@@ -1,272 +1,127 @@
-import json
+"""Ingest Lambda: fetch arXiv papers, embed title+abstract, store in pgvector."""
 import logging
-import os
-import sys
-from typing import Dict, Any, List
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from typing import Any, Dict, List
 
-# Configure SSL certificates BEFORE any boto3 imports
-# Use system CA bundle instead of certifi
-ca_bundle_paths = [
-    '/etc/pki/tls/certs/ca-bundle.crt',  # Amazon Linux
-    '/etc/ssl/certs/ca-certificates.crt',  # Debian/Ubuntu
-    '/etc/ssl/ca-bundle.pem',  # OpenSUSE
-]
+from common.db_utils import get_or_create_topic, initialize_database, insert_paper, paper_exists
+from common.http_utils import BadRequest, clamp_int, parse_body, require_text, response, server_error
 
-for ca_path in ca_bundle_paths:
-    if os.path.exists(ca_path):
-        os.environ['AWS_CA_BUNDLE'] = ca_path
-        os.environ['REQUESTS_CA_BUNDLE'] = ca_path
-        break
-
-# Set up logging first
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Import common utilities - add paths for Lambda runtime
-sys.path.insert(0, '/opt/python')  # Lambda layer path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.insert(0, parent_dir)
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+MAX_PAPERS = 50
+ARXIV_TIMEOUT_SECONDS = 30
 
-try:
-    import boto3
-    from common.bedrock_utils import generate_embeddings
-    from common.db_utils import get_connection, execute_query, test_connection, initialize_database, get_or_create_topic, paper_exists, insert_paper
-except ImportError as e:
-    logger.error(f"Import error: {e}")
-    raise
+
+def _text(entry: ET.Element, tag: str, default: str = "") -> str:
+    element = entry.find(tag, ATOM_NS)
+    if element is None or element.text is None:
+        return default
+    return " ".join(element.text.split())  # collapse newlines and repeated spaces
+
+
+def parse_arxiv_response(xml_content: str) -> List[Dict[str, Any]]:
+    """Parse an arXiv Atom feed into paper dicts. Entries without an ID are skipped."""
+    root = ET.fromstring(xml_content)
+    papers = []
+    for entry in root.findall("atom:entry", ATOM_NS):
+        raw_id = _text(entry, "atom:id")
+        if not raw_id:
+            continue
+        published = _text(entry, "atom:published")
+        papers.append({
+            "arxiv_id": raw_id.rstrip("/").split("/abs/")[-1],
+            "title": _text(entry, "atom:title", "Untitled"),
+            "authors": "; ".join(
+                _text(author, "atom:name") for author in entry.findall("atom:author", ATOM_NS)
+            ),
+            "abstract": _text(entry, "atom:summary"),
+            "published_date": published[:10] if published else None,
+            "categories": ", ".join(
+                c.get("term") for c in entry.findall("atom:category", ATOM_NS) if c.get("term")
+            ),
+        })
+    return papers
+
+
+def build_arxiv_url(query: str, max_results: int) -> str:
+    params = {"search_query": f"all:{query}", "start": 0, "max_results": max_results}
+    return f"{ARXIV_API_URL}?{urllib.parse.urlencode(params)}"
+
 
 def fetch_arxiv_papers(query: str, max_results: int = 10) -> List[Dict[str, Any]]:
-    """
-    Fetch papers from arXiv API using urllib
-    
-    Args:
-        query: Search query string
-        max_results: Maximum number of papers to fetch
-        
-    Returns:
-        List of paper dictionaries with title, authors, abstract, etc.
-    """
-    papers = []
-    
-    try:
-        # Construct arXiv API query URL
-        base_url = "http://export.arxiv.org/api/query"
-        search_query = f"all:{query.replace(' ', '+')}"
-        params = {
-            'search_query': search_query,
-            'start': 0,
-            'max_results': max_results
-        }
-        
-        url = f"{base_url}?{urllib.parse.urlencode(params)}"
-        logger.info(f"Fetching from arXiv: {url}")
-        
-        # Make the request
-        with urllib.request.urlopen(url) as response:
-            xml_content = response.read().decode('utf-8')
-        
-        # Parse XML response
-        root = ET.fromstring(xml_content)
-        
-        # Extract namespace
-        namespace = {'atom': 'http://www.w3.org/2005/Atom'}
-        
-        # Parse entries
-        for entry in root.findall('atom:entry', namespace):
-            # Extract paper information
-            title = entry.find('atom:title', namespace)
-            title_text = title.text.strip().replace('\n', ' ') if title is not None else "No title"
-            
-            # Get arXiv ID from the id field
-            id_element = entry.find('atom:id', namespace)
-            arxiv_id = id_element.text.split('/')[-1] if id_element is not None else "unknown"
-            
-            # Extract authors
-            authors = []
-            for author in entry.findall('atom:author', namespace):
-                name_elem = author.find('atom:name', namespace)
-                if name_elem is not None:
-                    authors.append(name_elem.text.strip())
-            
-            # Extract abstract/summary
-            summary = entry.find('atom:summary', namespace)
-            abstract = summary.text.strip().replace('\n', ' ') if summary is not None else "No abstract"
-            
-            # Extract published date
-            published = entry.find('atom:published', namespace)
-            published_date = published.text[:10] if published is not None else "unknown"
-            
-            # Extract categories
-            categories = []
-            for category in entry.findall('atom:category', namespace):
-                term = category.get('term')
-                if term:
-                    categories.append(term)
-            
-            paper = {
-                'arxiv_id': arxiv_id,
-                'title': title_text,
-                'authors': '; '.join(authors),
-                'abstract': abstract,
-                'published_date': published_date,
-                'categories': ', '.join(categories)
-            }
-            
-            papers.append(paper)
-            
-        logger.info(f"Successfully fetched {len(papers)} papers")
-        return papers
-        
-    except Exception as e:
-        logger.error(f"Error fetching papers from arXiv: {e}")
-        return []
+    url = build_arxiv_url(query, max_results)
+    logger.info("Fetching from arXiv: %s", url)
+    request = urllib.request.Request(url, headers={"User-Agent": "ServerlessRAG/1.0"})
+    with urllib.request.urlopen(request, timeout=ARXIV_TIMEOUT_SECONDS) as resp:
+        return parse_arxiv_response(resp.read().decode("utf-8"))
+
 
 def main(event, context):
     """
-    Lambda handler for ingesting research papers from arXiv
-    
-    Expected event format:
+    POST /ingest
     {
-        "query": "machine learning",
-        "max_results": 10,
-        "topic_name": "Machine Learning"
+        "query": "quantum error correction",
+        "max_results": 10,              # optional, 1-50
+        "topic_name": "Quantum Computing"  # optional, defaults to the query in title case
     }
     """
+    started = time.perf_counter()
     try:
-        # Parse request
-        body = json.loads(event.get('body', '{}'))
-        query = body.get('query', 'machine learning')
-        max_results = body.get('max_results', 10)
-        topic_name = body.get('topic_name', query.title())
-        
-        logger.info(f"Starting ingestion for query: {query}, max_results: {max_results}")
-        
-        # Fetch papers from arXiv
+        body = parse_body(event)
+        query = require_text(body.get("query"), "query", 300)
+        max_results = clamp_int(body.get("max_results"), default=10, low=1, high=MAX_PAPERS, name="max_results")
+        topic_name = require_text(body.get("topic_name") or query.title(), "topic_name", 255)
+    except BadRequest as e:
+        return response(400, {"error": str(e)})
+
+    try:
         papers = fetch_arxiv_papers(query, max_results)
         if not papers:
-            return {
-                'statusCode': 404,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
-                    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-                },
-                'body': json.dumps({'error': 'No papers found'})
-            }
-        
-        logger.info(f"Fetched {len(papers)} papers from arXiv")
-        
-        # Try to initialize database and store papers
-        database_enabled = False
-        processed_count = 0
-        
-        try:
-            initialize_database()
-            database_enabled = True
-            logger.info("Database initialized successfully")
-            
-            # Get or create topic
-            topic_id = get_or_create_topic(topic_name, f"Research papers about {topic_name}")
-            
-            # Process each paper
-            for paper in papers:
-                try:
-                    # Check if paper already exists
-                    if paper_exists(paper['arxiv_id']):
-                        logger.info(f"Paper {paper['arxiv_id']} already exists, skipping")
-                        continue
-                    
-                    # Insert paper with embeddings
-                    paper_id = insert_paper(paper, topic_id)
-                    processed_count += 1
-                    logger.info(f"Successfully processed paper: {paper['arxiv_id']}")
-                    
-                except Exception as e:
-                    logger.error(f"Error processing paper {paper.get('arxiv_id', 'unknown')}: {e}")
+            return response(404, {"error": "No papers found on arXiv for this query"})
+
+        initialize_database()
+        topic_id = get_or_create_topic(topic_name, f"Research papers about {topic_name}")
+
+        inserted, skipped, failed = [], [], []
+        for paper in papers:
+            try:
+                if paper_exists(paper["arxiv_id"]):
+                    skipped.append(paper["arxiv_id"])
                     continue
-            
-        except Exception as db_error:
-            logger.warning(f"Database operations failed: {db_error}")
-            logger.info("Falling back to embedding-only mode")
-            
-            # Fallback: Test Bedrock embeddings on sample papers
-            sample_papers = papers[:3]  # First 3 papers
-            embeddings_generated = 0
-            embedding_errors = []
-            
-            for paper in sample_papers:
-                try:
-                    text_content = f"{paper['title']}\\n\\n{paper['abstract']}"
-                    embeddings = generate_embeddings([text_content])
-                    embeddings_generated += 1
-                    logger.info(f"Generated embedding for: {paper['title'][:50]}...")
-                except Exception as e:
-                    error_msg = f"Embedding failed for {paper['title'][:30]}...: {str(e)}"
-                    embedding_errors.append(error_msg)
-                    logger.error(error_msg)
-            
-            # Return fallback response
-            return {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': f'Database unavailable. Processed {len(papers)} papers from arXiv (embeddings only)',
-                    'total_papers_fetched': len(papers),
-                    'embeddings_generated': embeddings_generated,
-                    'embedding_errors': embedding_errors,
-                    'database_enabled': False,
-                    'database_error': str(db_error),
-                    'sample_papers': [
-                        {
-                            'title': paper['title'],
-                            'authors': paper['authors'],
-                            'arxiv_id': paper['arxiv_id'],
-                            'published_date': paper['published_date']
-                        } for paper in sample_papers
-                    ]
-                })
-            }
-        
-        # Return response
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
-                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-            },
-            'body': json.dumps({
-                'message': f"Successfully processed {processed_count} papers",
-                'total_papers_fetched': len(papers),
-                'processed_count': processed_count,
-                'database_enabled': database_enabled,
-                'topic': topic_name,
-                'papers': [
-                    {
-                        'title': paper['title'],
-                        'authors': paper['authors'],
-                        'arxiv_id': paper['arxiv_id'],
-                        'published_date': paper['published_date']
-                    } for paper in papers[:5]  # First 5 papers
-                ]
-            })
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in ingest handler: {e}")
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
-                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-            },
-            'body': json.dumps({'error': str(e)})
-        }
+                insert_paper(paper, topic_id)
+                inserted.append(paper["arxiv_id"])
+            except Exception:
+                logger.exception("Failed to ingest %s", paper["arxiv_id"])
+                failed.append(paper["arxiv_id"])
+
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        logger.info("ingest ok topic=%s inserted=%s skipped=%s failed=%s ms=%s",
+                    topic_name, len(inserted), len(skipped), len(failed), elapsed_ms)
+
+        return response(200, {
+            "message": f"Inserted {len(inserted)} new papers",
+            "topic": topic_name,
+            "total_papers_fetched": len(papers),
+            "inserted_count": len(inserted),
+            "skipped_duplicates": len(skipped),
+            "failed_count": len(failed),
+            "elapsed_ms": elapsed_ms,
+            "papers": [
+                {
+                    "arxiv_id": p["arxiv_id"],
+                    "title": p["title"],
+                    "authors": p["authors"],
+                    "published_date": p["published_date"],
+                }
+                for p in papers
+            ],
+        })
+    except Exception:
+        logger.exception("Error in ingest handler")
+        return server_error(context)

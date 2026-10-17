@@ -7,10 +7,34 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import { Construct } from 'constructs';
 import * as path from 'path';
+import * as fs from 'fs';
 
 export class ServerlessRagStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    // ---- Configuration (override with: cdk deploy -c key=value) ----
+    const repoRoot = path.join(__dirname, '..', '..');
+    // Origin allowed by CORS, e.g. -c allowedOrigin=http://ec2-1-2-3-4.compute-1.amazonaws.com
+    const allowedOrigin: string = this.node.tryGetContext('allowedOrigin') ?? '*';
+    // Git repo the Chat UI instance clones its static files from
+    const uiRepoUrl: string = this.node.tryGetContext('uiRepoUrl') ?? 'https://gitlab.com/mukeshethiraj0/serverlessrag.git';
+    // API Gateway stage throttling (requests per second / burst)
+    const throttleRate = Number(this.node.tryGetContext('throttleRate') ?? 5);
+    const throttleBurst = Number(this.node.tryGetContext('throttleBurst') ?? 10);
+
+    // Single source of truth for shared code: copy common/ into each Lambda
+    // package at synth time instead of keeping duplicated copies in git.
+    for (const fn of ['lambda_ingest', 'lambda_chat']) {
+      const dest = path.join(repoRoot, fn, 'common');
+      fs.rmSync(dest, { recursive: true, force: true });
+      fs.cpSync(path.join(repoRoot, 'common'), dest, { recursive: true });
+    }
+
+    const layerDir = path.join(repoRoot, 'lambda_layer');
+    if (!fs.existsSync(path.join(layerDir, 'python'))) {
+      throw new Error('Lambda layer not built. Run ./scripts/build_layer.sh from the repo root first.');
+    }
 
     // VPC for RDS
     const vpc = new ec2.Vpc(this, 'RagVPC', {
@@ -62,11 +86,8 @@ export class ServerlessRagStack extends cdk.Stack {
       'Allow HTTP traffic'
     );
 
-    webSecurityGroup.addIngressRule(
-      ec2.Peer.anyIpv4(),
-      ec2.Port.tcp(22),
-      'Allow SSH access'
-    );
+    // No SSH ingress: use AWS Systems Manager Session Manager for shell access
+    // (the instance role includes AmazonSSMManagedInstanceCore).
 
     // Allow Lambda to connect to RDS
     dbSecurityGroup.addIngressRule(
@@ -146,7 +167,7 @@ export class ServerlessRagStack extends cdk.Stack {
 
     // Python layer with dependencies
     const pythonLayer = new lambda.LayerVersion(this, 'PythonDepsLayer', {
-      code: lambda.Code.fromAsset('../lambda_layer'),
+      code: lambda.Code.fromAsset(layerDir),
       compatibleRuntimes: [lambda.Runtime.PYTHON_3_11],
       description: 'Python dependencies for RAG functions',
     });
@@ -156,13 +177,14 @@ export class ServerlessRagStack extends cdk.Stack {
       DB_SECRET_ARN: database.secret?.secretArn || '',
       DB_CLUSTER_ARN: database.clusterArn,
       REGION: this.region,
+      ALLOWED_ORIGIN: allowedOrigin,
     };
 
     // Ingest Lambda function
     const ingestFunction = new lambda.Function(this, 'IngestFunction', {
       runtime: lambda.Runtime.PYTHON_3_11,
       handler: 'handler.main',
-      code: lambda.Code.fromAsset('../lambda_ingest'),
+      code: lambda.Code.fromAsset(path.join(repoRoot, 'lambda_ingest'), { exclude: ['requirements.txt'] }),
       layers: [pythonLayer],
       role: lambdaRole,
       vpc,
@@ -182,7 +204,7 @@ export class ServerlessRagStack extends cdk.Stack {
     const chatFunction = new lambda.Function(this, 'ChatFunction', {
       runtime: lambda.Runtime.PYTHON_3_11,
       handler: 'handler.main',
-      code: lambda.Code.fromAsset('../lambda_chat'),
+      code: lambda.Code.fromAsset(path.join(repoRoot, 'lambda_chat'), { exclude: ['requirements.txt'] }),
       layers: [pythonLayer],
       role: lambdaRole,
       vpc,
@@ -202,9 +224,14 @@ export class ServerlessRagStack extends cdk.Stack {
     const api = new apigateway.RestApi(this, 'RagApi', {
       restApiName: 'Serverless RAG API',
       description: 'API for serverless RAG system',
+      deployOptions: {
+        stageName: 'prod',
+        throttlingRateLimit: throttleRate,
+        throttlingBurstLimit: throttleBurst,
+      },
       defaultCorsPreflightOptions: {
-        allowOrigins: apigateway.Cors.ALL_ORIGINS,
-        allowMethods: apigateway.Cors.ALL_METHODS,
+        allowOrigins: allowedOrigin === '*' ? apigateway.Cors.ALL_ORIGINS : [allowedOrigin],
+        allowMethods: ['POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'X-Amz-Date', 'Authorization', 'X-Api-Key'],
       },
     });
@@ -308,10 +335,10 @@ export class ServerlessRagStack extends cdk.Stack {
       
       // Clone repository with better error handling
       'echo "=== Cloning repository ==="',
-      'git clone https://github.com/madhurlak0810/Custom-Research.git . || {',
+      `git clone ${uiRepoUrl} . || {`,
       '  echo "Git clone failed, trying again..."',
       '  sleep 10',
-      '  git clone https://github.com/madhurlak0810/Custom-Research.git . || {',
+      `  git clone ${uiRepoUrl} . || {`,
       '    echo "Second git clone failed, creating minimal structure"',
       '    mkdir -p chat_ui',
       '    echo "Error: Could not clone repository" > chat_ui/error.html',
@@ -453,7 +480,7 @@ EOF`,
       machineImage: ec2.MachineImage.latestAmazonLinux2(),
       userData: userData,
       role: ec2Role,
-      keyName: 'chatui-debug', // Enable SSH for debugging
+      requireImdsv2: true,
     });
 
     // Outputs

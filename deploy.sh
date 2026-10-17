@@ -1,122 +1,39 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# One-command deploy: builds the Lambda layer, deploys the CDK stack, prints the endpoints.
+# Extra CDK options are passed through, e.g. ./deploy.sh -c allowedOrigin=http://my-ui-host
+set -euo pipefail
+cd "$(dirname "$0")"
 
-# AWS Serverless RAG Deployment Script
-# This script automates the deployment process
-
-set -e
-
-echo "🚀 AWS Serverless RAG Deployment Script"
-echo "========================================"
-
-# Check if AWS CLI is installed
-if ! command -v aws &> /dev/null; then
-    echo "❌ AWS CLI not found. Please install AWS CLI first."
-    exit 1
-fi
-
-# Check if CDK is installed
-if ! command -v cdk &> /dev/null; then
-    echo "📦 Installing AWS CDK..."
-    npm install -g aws-cdk
-fi
-
-# Check AWS credentials
-echo "🔐 Checking AWS credentials..."
-if ! aws sts get-caller-identity &> /dev/null; then
-    echo "❌ AWS credentials not configured. Please run 'aws configure' first."
-    exit 1
-fi
+command -v aws >/dev/null || { echo "AWS CLI not found. Install it first."; exit 1; }
+command -v npm >/dev/null || { echo "Node.js/npm not found. Install Node 18+ first."; exit 1; }
+aws sts get-caller-identity >/dev/null || { echo "AWS credentials not configured. Run 'aws configure'."; exit 1; }
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-REGION="us-east-1"
+REGION="${CDK_DEFAULT_REGION:-us-east-1}"
+echo "Account: $ACCOUNT_ID  Region: $REGION"
 
-echo "✅ Using AWS Account: $ACCOUNT_ID"
-echo "✅ Using Region: $REGION"
+./scripts/build_layer.sh
 
-# Install Node.js dependencies
-echo "📦 Installing CDK dependencies..."
-npm install
-
-# Bootstrap CDK if needed
-echo "🏗️ Bootstrapping CDK..."
-cdk bootstrap aws://$ACCOUNT_ID/$REGION
-
-# Create Lambda layer
-echo "🐍 Creating Python Lambda layer..."
-mkdir -p lambda_layer/python
-
-# Install Python dependencies
-echo "📦 Installing Python dependencies..."
-pip install -t lambda_layer/python/ psycopg2-binary boto3 requests urllib3
-
-# Create layer zip
-cd lambda_layer
-zip -r python-dependencies.zip python/
-cd ..
-
-echo "✅ Lambda layer created: lambda_layer/python-dependencies.zip"
-
-# Check Bedrock model access
-echo "🤖 Bedrock models are automatically enabled on first use!"
-echo "✅ Amazon Titan Text Embeddings V2: Auto-enabled"
-echo "✅ Anthropic Claude 3.5 Sonnet: Auto-enabled"
-echo "   (Note: First-time Anthropic users may need to submit use case details)"
-
-# Deploy the stack
-echo "🚀 Deploying CDK stack..."
 cd infrastructure
-cdk deploy ServerlessRagStack --require-approval never
+npm install
+npx cdk bootstrap "aws://$ACCOUNT_ID/$REGION"
+npx cdk deploy ServerlessRagStack --require-approval never "$@"
 cd ..
 
-# Get outputs
-echo "📊 Getting deployment outputs..."
-API_URL=$(aws cloudformation describe-stacks --stack-name ServerlessRagStack --query 'Stacks[0].Outputs[?OutputKey==`ApiGatewayUrl`].OutputValue' --output text 2>/dev/null || echo "")
-RDS_ENDPOINT=$(aws cloudformation describe-stacks --stack-name ServerlessRagStack --query 'Stacks[0].Outputs[?OutputKey==`DatabaseEndpoint`].OutputValue' --output text 2>/dev/null || echo "")
+output() {
+  aws cloudformation describe-stacks --stack-name ServerlessRagStack --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
+API_URL=$(output ApiEndpoint)
+UI_URL=$(output ChatUIUrl)
 
-if [ ! -z "$API_URL" ]; then
-    echo "✅ API Gateway URL: $API_URL"
-fi
-
-if [ ! -z "$RDS_ENDPOINT" ]; then
-    echo "✅ RDS Endpoint: $RDS_ENDPOINT"
-fi
-
-# Setup database schema
-echo "🗄️ Setting up database schema..."
-DB_SECRET_ARN=$(aws cloudformation describe-stacks --stack-name ServerlessRagStack --query 'Stacks[0].Outputs[?OutputKey==`DatabaseSecretArn`].OutputValue' --output text 2>/dev/null || echo "")
-
-if [ ! -z "$DB_SECRET_ARN" ] && [ ! -z "$RDS_ENDPOINT" ]; then
-    echo "📝 Database schema will be applied automatically by Lambda functions on first run"
-else
-    echo "⚠️  Database connection info not available. Schema setup will happen automatically."
-fi
-
-echo ""
-echo "🎉 Deployment Complete!"
-echo "======================"
-echo ""
-echo "🔗 API Endpoints:"
-if [ ! -z "$API_URL" ]; then
-    echo "   Ingest Papers: POST $API_URL/ingest"
-    echo "   Chat with RAG: POST $API_URL/chat"
-else
-    echo "   Check CloudFormation stack outputs for API URLs"
-fi
-echo ""
-echo "📊 Test the deployment:"
-echo "   # Ingest papers"
-echo "   curl -X POST '$API_URL/ingest' \\"
-echo "     -H 'Content-Type: application/json' \\"
-echo "     -d '{\"query\": \"machine learning\", \"max_results\": 5}'"
-echo ""
-echo "   # Chat with RAG"
-echo "   curl -X POST '$API_URL/chat' \\"
-echo "     -H 'Content-Type: application/json' \\"
-echo "     -d '{\"query\": \"What are recent developments in AI?\", \"max_results\": 3}'"
-echo ""
-echo "🔍 Monitor logs:"
-echo "   aws logs tail /aws/lambda/ServerlessRagStack-IngestFunction --follow"
-echo "   aws logs tail /aws/lambda/ServerlessRagStack-ChatFunction --follow"
-echo ""
-echo "🧹 To cleanup (delete all resources):"
-echo "   cd infrastructure && cdk destroy ServerlessRagStack"
+echo
+echo "API:     ${API_URL}"
+echo "Chat UI: ${UI_URL}  (allow a few minutes for the instance to finish setup)"
+echo
+echo "Try it:"
+echo "  curl -X POST '${API_URL}ingest' -H 'Content-Type: application/json' -d '{\"query\": \"retrieval augmented generation\", \"max_results\": 10}'"
+echo "  curl -X POST '${API_URL}chat'   -H 'Content-Type: application/json' -d '{\"query\": \"How do RAG systems reduce hallucination?\"}'"
+echo
+echo "Clean up when done (Aurora and the NAT gateway cost money while running):"
+echo "  cd infrastructure && npx cdk destroy ServerlessRagStack"

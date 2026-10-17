@@ -227,7 +227,7 @@ class ResearchAssistantUI {
             }
 
             this.showStatus('ingestStatus', 
-                `Successfully processed ${result.processed_count} papers for topic: ${result.topic}`, 
+                `Inserted ${result.inserted_count} new papers (${result.skipped_duplicates} already stored) for topic: ${result.topic}`, 
                 'success'
             );
 

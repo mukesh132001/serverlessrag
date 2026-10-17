@@ -1,0 +1,2 @@
+{"question": "Which approach combines a dense retriever with a seq2seq generator trained end to end?", "relevant_arxiv_ids": ["2005.11401"], "topic": "RAG"}
+{"question": "How can a language model decide on its own when to retrieve and critique its outputs?", "relevant_arxiv_ids": ["2310.11511"], "topic": "RAG"}
