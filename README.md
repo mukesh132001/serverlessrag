@@ -303,3 +303,4 @@ cdk destroy
 | **Lambda execution**              | $0.00002–$0.00008 per request                  | N/A                                                |
 | **EC2 hosting UI**                | Fixed cost ~$9/month                           | Included                                           |
 | **TOTAL per request (realistic)** | **$0.002 – $0.015 per query**                  | **~$0.04 – $0.12 per query (hidden cost)**         |
+Uploaded by Mukesh
