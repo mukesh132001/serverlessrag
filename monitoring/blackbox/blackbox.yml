@@ -1,0 +1,14 @@
+modules:
+  # GET /health must return 200 with {"status": "ok"} over TLS within 10 s.
+  http_health:
+    prober: http
+    timeout: 10s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      fail_if_not_ssl: false   # local dev probes plain http; API Gateway is always https
+      fail_if_body_not_matches_regexp:
+        - '"status":\s*"ok"'
+      preferred_ip_protocol: ip4
+      headers:
+        User-Agent: serverlessrag-uptime-probe

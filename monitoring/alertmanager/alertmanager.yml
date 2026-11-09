@@ -1,0 +1,30 @@
+# Routes SLO burn-rate alerts by severity. Out of the box alerts are visible in the
+# Alertmanager UI (:9093) and Grafana. To get notified, set a receiver, e.g.:
+#
+#   - name: page
+#     slack_configs:
+#       - api_url: https://hooks.slack.com/services/XXX
+#         channel: "#serverlessrag-alerts"
+#         send_resolved: true
+#
+# or email_configs / webhook_configs (https://prometheus.io/docs/alerting/latest/configuration/).
+route:
+  receiver: ticket
+  group_by: [alertname, slo]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: [severity="page"]
+      receiver: page
+      repeat_interval: 1h
+
+# A fast page should silence the slower ticket for the same SLO.
+inhibit_rules:
+  - source_matchers: [severity="page"]
+    target_matchers: [severity="ticket"]
+    equal: [slo]
+
+receivers:
+  - name: page
+  - name: ticket

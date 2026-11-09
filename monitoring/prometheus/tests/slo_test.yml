@@ -1,0 +1,79 @@
+# promtool test rules monitoring/prometheus/tests/slo_test.yml
+# (run from monitoring/prometheus so rule_files resolve)
+rule_files:
+  - ../rules/slo.yml
+evaluation_interval: 1m
+
+tests:
+  # 1. Healthy: 0.1% errors, all requests fast -> no alerts, budget mostly intact.
+  - interval: 1m
+    input_series:
+      - series: 'rag_request_duration_seconds_count{route="/chat",status_class="2xx",instance="a"}'
+        values: '0+999x180'
+      - series: 'rag_request_duration_seconds_count{route="/chat",status_class="5xx",instance="a"}'
+        values: '0+1x180'
+      - series: 'rag_request_duration_seconds_bucket{route="/chat",status_class="2xx",instance="a",le="4"}'
+        values: '0+999x180'
+    alert_rule_test:
+      - eval_time: 3h
+        alertname: SLOErrorBudgetBurn
+        exp_alerts: []
+    promql_expr_test:
+      - expr: round(slo:sli_error:ratio_rate1h{slo="chat-availability"}, 0.0001)
+        eval_time: 3h
+        exp_samples:
+          - labels: '{slo="chat-availability"}'
+            value: 0.001
+      - expr: round(slo:error_budget_remaining:ratio{slo="chat-availability"}, 0.01)
+        eval_time: 3h
+        exp_samples:
+          - labels: '{slo="chat-availability"}'
+            value: 0.8
+
+  # 2. Outage: 10% of requests fail for an hour -> fast-burn page (14.4x, 1h/5m) fires.
+  - interval: 1m
+    input_series:
+      - series: 'rag_request_duration_seconds_count{route="/chat",status_class="2xx",instance="a"}'
+        values: '0+90x70'
+      - series: 'rag_request_duration_seconds_count{route="/chat",status_class="5xx",instance="a"}'
+        values: '0+10x70'
+      - series: 'rag_request_duration_seconds_bucket{route="/chat",status_class="2xx",instance="a",le="4"}'
+        values: '0+90x70'
+    alert_rule_test:
+      # Before the 2m "for" elapses nothing pages yet.
+      - eval_time: 1m
+        alertname: SLOErrorBudgetBurn
+        exp_alerts: []
+      # Minutes into the outage only the fast-burn page fires (6x waits 15m, tickets wait longer).
+      - eval_time: 6m
+        alertname: SLOErrorBudgetBurn
+        exp_alerts:
+          - exp_labels: {severity: page, slo: chat-availability, burn_rate: "14.4", long_window: 1h, short_window: 5m}
+            exp_annotations:
+              summary: "chat-availability: error budget burning 14.4x too fast (1h/5m windows)"
+              description: "SLO: 99.5% of POST /chat requests return a non-5xx response. Error ratio over 1h is 10% (threshold 7.2% = 14.4x the 0.5% budget). At this rate the 30-day budget is gone in 2.08 days."
+              dashboard: /d/serverlessrag-slo
+
+  # 3. Slow model: 40% of successful requests take longer than 4 s, no errors.
+  #    p95 SLO budget is 5%, so this burns 8x: the 6x/6h page fires, the 14.4x does not.
+  - interval: 1m
+    input_series:
+      - series: 'rag_request_duration_seconds_count{route="/chat",status_class="2xx",instance="a"}'
+        values: '0+100x60'
+      - series: 'rag_request_duration_seconds_bucket{route="/chat",status_class="2xx",instance="a",le="4.0"}'
+        values: '0+60x60'
+    promql_expr_test:
+      - expr: round(slo:burn_rate:1h{slo="chat-latency"}, 0.1)
+        eval_time: 30m
+        exp_samples:
+          - labels: '{slo="chat-latency"}'
+            value: 8
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SLOErrorBudgetBurn
+        exp_alerts:
+          - exp_labels: {severity: page, slo: chat-latency, burn_rate: "6", long_window: 6h, short_window: 30m}
+            exp_annotations:
+              summary: "chat-latency: error budget burning 6x too fast (6h/30m windows)"
+              description: "SLO: 95% of successful POST /chat requests complete in under 4 s (p95 < 4 s). Error ratio over 6h is 40% (threshold 30% = 6x the 5% budget). At this rate the 30-day budget is gone in 5 days."
+              dashboard: /d/serverlessrag-slo

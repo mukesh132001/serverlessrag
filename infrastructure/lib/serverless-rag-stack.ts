@@ -5,6 +5,12 @@ import * as rds from 'aws-cdk-lib/aws-rds';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cwActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -22,6 +28,16 @@ export class ServerlessRagStack extends cdk.Stack {
     // API Gateway stage throttling (requests per second / burst)
     const throttleRate = Number(this.node.tryGetContext('throttleRate') ?? 5);
     const throttleBurst = Number(this.node.tryGetContext('throttleBurst') ?? 10);
+    // Monitoring host (OTel Collector, Prometheus, Grafana, Alertmanager, blackbox_exporter): -c monitoring=true
+    const monitoringEnabled = String(this.node.tryGetContext('monitoring') ?? 'false') === 'true';
+    // CIDR allowed to reach Grafana on :3000, e.g. -c monitoringAllowedCidr=203.0.113.7/32.
+    // Unset = no public access; use SSM port forwarding (see monitoring/README.md).
+    const monitoringAllowedCidr: string | undefined = this.node.tryGetContext('monitoringAllowedCidr');
+    // Email for CloudWatch alarm notifications: -c alarmEmail=you@example.com
+    const alarmEmail: string | undefined = this.node.tryGetContext('alarmEmail');
+    // Read by the monitoring host at boot. A fixed name (not a token) avoids a
+    // dependency cycle: Lambda env -> monitoring host -> API URL -> Lambda.
+    const apiUrlParameterName = '/serverlessrag/api-url';
 
     // Single source of truth for shared code: copy common/ into each Lambda
     // package at synth time instead of keeping duplicated copies in git.
@@ -172,6 +188,79 @@ export class ServerlessRagStack extends cdk.Stack {
       description: 'Python dependencies for RAG functions',
     });
 
+    // ---- Monitoring host (optional) ----
+    let otlpEndpoint: string | undefined;
+    let monitoringInstance: ec2.Instance | undefined;
+    if (monitoringEnabled) {
+      const monitoringSG = new ec2.SecurityGroup(this, 'MonitoringSG', {
+        vpc,
+        description: 'OTel Collector, Prometheus, Grafana',
+        allowAllOutbound: true, // pulls images; blackbox_exporter probes the public API URL
+      });
+      // Lambdas push OTLP/HTTP metrics to the collector over the VPC.
+      monitoringSG.addIngressRule(lambdaSecurityGroup, ec2.Port.tcp(4318), 'OTLP/HTTP from Lambdas');
+      if (monitoringAllowedCidr) {
+        monitoringSG.addIngressRule(ec2.Peer.ipv4(monitoringAllowedCidr), ec2.Port.tcp(3000), 'Grafana');
+      }
+
+      const grafanaSecret = new secretsmanager.Secret(this, 'GrafanaAdminPassword', {
+        description: 'Grafana admin password for the ServerlessRAG monitoring host',
+        generateSecretString: { excludePunctuation: true, passwordLength: 24 },
+      });
+
+      const monitoringRole = new iam.Role(this, 'MonitoringInstanceRole', {
+        assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
+        managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore')],
+      });
+      grafanaSecret.grantRead(monitoringRole);
+      monitoringRole.addToPolicy(new iam.PolicyStatement({
+        actions: ['ssm:GetParameter'],
+        resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${apiUrlParameterName}`],
+      }));
+
+      const monitoringUserData = ec2.UserData.forLinux();
+      monitoringUserData.addCommands(
+        'set -euxo pipefail',
+        'exec > >(tee /var/log/monitoring-setup.log) 2>&1',
+        'dnf install -y docker git',
+        'systemctl enable --now docker',
+        'mkdir -p /usr/local/lib/docker/cli-plugins',
+        'curl -fsSL https://github.com/docker/compose/releases/download/v2.39.1/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose',
+        'chmod +x /usr/local/lib/docker/cli-plugins/docker-compose',
+        `git clone ${uiRepoUrl} /opt/serverlessrag`,
+        // The API URL parameter is created in the same deployment; wait for it.
+        `for i in $(seq 1 60); do API_URL=$(aws ssm get-parameter --region ${this.region} --name ${apiUrlParameterName} --query Parameter.Value --output text) && break; sleep 10; done`,
+        `export GRAFANA_ADMIN_PASSWORD=$(aws secretsmanager get-secret-value --region ${this.region} --secret-id ${grafanaSecret.secretArn} --query SecretString --output text)`,
+        'cd /opt/serverlessrag/monitoring && ./setup.sh "$API_URL"',
+      );
+
+      monitoringInstance = new ec2.Instance(this, 'MonitoringInstance', {
+        vpc,
+        vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+        securityGroup: monitoringSG,
+        instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
+        machineImage: ec2.MachineImage.latestAmazonLinux2023(),
+        userData: monitoringUserData,
+        role: monitoringRole,
+        requireImdsv2: true,
+        blockDevices: [{ deviceName: '/dev/xvda', volume: ec2.BlockDeviceVolume.ebs(20, { encrypted: true }) }],
+      });
+      otlpEndpoint = `http://${monitoringInstance.instancePrivateIp}:4318`;
+
+      new cdk.CfnOutput(this, 'MonitoringInstanceId', { value: monitoringInstance.instanceId });
+      new cdk.CfnOutput(this, 'GrafanaUrl', {
+        value: monitoringAllowedCidr
+          ? `http://${monitoringInstance.instancePublicDnsName}:3000`
+          : 'SSM port forwarding: see monitoring/README.md',
+      });
+      new cdk.CfnOutput(this, 'GrafanaPasswordSecret', { value: grafanaSecret.secretName });
+    }
+
+    // OpenTelemetry settings (common/telemetry.py is a no-op without an endpoint)
+    const otelEnv = (serviceName: string): Record<string, string> => (otlpEndpoint
+      ? { OTEL_EXPORTER_OTLP_ENDPOINT: otlpEndpoint, OTEL_SERVICE_NAME: serviceName }
+      : {});
+
     // Common environment variables
     const commonEnvVars = {
       DB_SECRET_ARN: database.secret?.secretArn || '',
@@ -196,6 +285,7 @@ export class ServerlessRagStack extends cdk.Stack {
       memorySize: 1024,
       environment: {
         ...commonEnvVars,
+        ...otelEnv('rag-ingest'),
       },
       logRetention: logs.RetentionDays.ONE_WEEK,
     });
@@ -216,6 +306,7 @@ export class ServerlessRagStack extends cdk.Stack {
       memorySize: 512,
       environment: {
         ...commonEnvVars,
+        ...otelEnv('rag-chat'),
       },
       logRetention: logs.RetentionDays.ONE_WEEK,
     });
@@ -290,6 +381,78 @@ export class ServerlessRagStack extends cdk.Stack {
             'method.response.header.Access-Control-Allow-Origin': true,
           },
         },
+      ],
+    });
+
+    // GET /health -> chat Lambda -> SELECT 1. Target of the external uptime probe.
+    api.root.addResource('health').addMethod('GET', new apigateway.LambdaIntegration(chatFunction, { proxy: true }));
+
+    new ssm.StringParameter(this, 'ApiUrlParameter', {
+      parameterName: apiUrlParameterName,
+      stringValue: api.url,
+      description: 'ServerlessRAG API base URL (read by the monitoring host)',
+    });
+
+    // ---- CloudWatch alarms (AWS-side view: catches what in-process metrics cannot,
+    // e.g. Lambda timeouts/OOM before the metric flush, and API Gateway 429/5xx) ----
+    const alarmTopic = new sns.Topic(this, 'AlarmTopic', { displayName: 'ServerlessRAG alarms' });
+    if (alarmEmail) {
+      alarmTopic.addSubscription(new subs.EmailSubscription(alarmEmail));
+    }
+    const alarmAction = new cwActions.SnsAction(alarmTopic);
+    const fiveMin = cdk.Duration.minutes(5);
+    const alarms: cloudwatch.Alarm[] = [
+      new cloudwatch.Alarm(this, 'ChatLambdaErrors', {
+        alarmDescription: 'Chat Lambda invocation errors (unhandled exceptions, timeouts)',
+        metric: chatFunction.metricErrors({ period: fiveMin, statistic: 'Sum' }),
+        threshold: 3, evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'ChatLambdaThrottles', {
+        alarmDescription: 'Chat Lambda throttled by concurrency limits',
+        metric: chatFunction.metricThrottles({ period: fiveMin, statistic: 'Sum' }),
+        threshold: 1, evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'Api5xxRate', {
+        alarmDescription: 'API Gateway 5XX rate above 0.5% (the availability SLO budget)',
+        metric: api.metricServerError({ period: fiveMin, statistic: 'Average' }),
+        threshold: 0.005, evaluationPeriods: 3, datapointsToAlarm: 2,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'ApiLatencyP95', {
+        alarmDescription: 'API Gateway p95 latency above 4 s (the latency SLO threshold)',
+        metric: api.metricLatency({ period: fiveMin, statistic: 'p95' }),
+        threshold: 4000, evaluationPeriods: 3, datapointsToAlarm: 2,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    ];
+    alarms.forEach((alarm) => alarm.addAlarmAction(alarmAction));
+
+    new cloudwatch.Dashboard(this, 'CloudWatchDashboard', {
+      dashboardName: 'ServerlessRAG',
+      widgets: [
+        [
+          new cloudwatch.GraphWidget({ title: 'API requests', left: [api.metricCount({ period: cdk.Duration.minutes(1) })], width: 8 }),
+          new cloudwatch.GraphWidget({
+            title: 'API 4XX / 5XX', width: 8,
+            left: [api.metricClientError({ period: cdk.Duration.minutes(1), statistic: 'Sum' }),
+                   api.metricServerError({ period: cdk.Duration.minutes(1), statistic: 'Sum' })],
+          }),
+          new cloudwatch.GraphWidget({
+            title: 'API latency p50 / p95', width: 8,
+            left: [api.metricLatency({ period: cdk.Duration.minutes(1), statistic: 'p50' }),
+                   api.metricLatency({ period: cdk.Duration.minutes(1), statistic: 'p95' })],
+          }),
+        ],
+        [
+          new cloudwatch.GraphWidget({
+            title: 'Chat Lambda duration p95 / errors', width: 12,
+            left: [chatFunction.metricDuration({ period: cdk.Duration.minutes(1), statistic: 'p95' })],
+            right: [chatFunction.metricErrors({ period: cdk.Duration.minutes(1), statistic: 'Sum' })],
+          }),
+          new cloudwatch.AlarmStatusWidget({ title: 'Alarms', alarms, width: 12 }),
+        ],
       ],
     });
 
@@ -503,6 +666,8 @@ EOF`,
       value: `http://${chatUIInstance.instancePublicDnsName}`,
       description: 'Chat UI web interface URL',
     });
+
+    new cdk.CfnOutput(this, 'AlarmTopicArn', { value: alarmTopic.topicArn });
 
     new cdk.CfnOutput(this, 'ChatUIInstanceId', {
       value: chatUIInstance.instanceId,

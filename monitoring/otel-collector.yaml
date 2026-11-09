@@ -1,0 +1,35 @@
+# Receives OTLP metrics from the Lambdas and exposes them for Prometheus to scrape.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 256
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Each Lambda container is its own series (service.instance.id). Drop a series
+    # 15 minutes after its container goes quiet; dashboards sum across containers.
+    metric_expiration: 15m
+    resource_to_telemetry_conversion:
+      enabled: false
+
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [prometheus]

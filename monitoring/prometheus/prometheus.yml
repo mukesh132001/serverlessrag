@@ -1,0 +1,51 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+  external_labels:
+    project: serverlessrag
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # Application metrics: Lambdas push OTLP to the collector, which exposes them here.
+  # honor_labels keeps job/instance as set by the collector (service.name / service.instance.id).
+  - job_name: otel-collector-app
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  # The collector's own health metrics.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  # External uptime check: blackbox_exporter calls GET <API>/health like a client would.
+  # Targets live in targets/blackbox.yml (written by setup.sh from the stack's API URL).
+  - job_name: blackbox-health
+    metrics_path: /probe
+    params:
+      module: [http_health]
+    scrape_interval: 30s
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/blackbox.yml"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: ["blackbox:9115"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

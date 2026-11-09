@@ -28,3 +28,11 @@
 - `retrieval_only` mode for cheap retrieval evaluation.
 - `eval/`: metrics (hit rate@k, MRR, recall@k, p50/p95 latency, LLM cost), an evaluation runner, and an eval-set template builder.
 - `tests/`: 30 offline unit tests.
+
+## Observability
+- OpenTelemetry metrics in both Lambdas (`common/telemetry.py`): request latency by route and status, per-stage latency, LLM tokens, cold starts. Flushed at the end of each invocation; a no-op when no collector is configured.
+- `monitoring/`: OTel Collector, Prometheus, Grafana (RED and SLO dashboards), Alertmanager and blackbox_exporter in Docker Compose.
+- Two SLOs on `POST /chat`, 99.5% non-5xx and 95% of successful requests under 4 s, with 30-day error budgets and multi-window burn-rate alerts (14.4x/6x page, 3x/1x ticket), unit-tested with `promtool test rules`.
+- `GET /health` endpoint and an external uptime probe against it.
+- CDK: optional monitoring instance (`-c monitoring=true`), CloudWatch alarms (Lambda errors and throttles, API 5XX rate, API p95 latency) with an SNS topic, and a CloudWatch dashboard.
+- `scripts/local_api.py`, `scripts/load_test.py` and `scripts/slo_report.py` to generate traffic and read measured SLO numbers from Prometheus.
