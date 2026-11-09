@@ -23,7 +23,7 @@ flowchart LR
 - **Ingestion:** fetches papers from arXiv, deduplicates by arXiv ID, embeds title + abstract (1024 dimensions, normalized), and stores one vector per paper.
 - **Retrieval:** cosine nearest-neighbour search over an HNSW index, optionally filtered by topic. Similarity is reported as `1 − cosine distance`.
 - **Generation:** the top results are passed to gpt-oss-20b with instructions to answer only from the sources and cite them as `[Source N]`.
-- **Observability:** each chat response includes per-stage timings (embedding, retrieval, generation) and token usage; Lambda logs go to CloudWatch.
+- **Observability:** OpenTelemetry metrics from both Lambdas go through an OTel Collector to Prometheus, with Grafana dashboards for traffic, errors and latency, two SLOs (99.5% success, p95 < 4 s) with multi-window burn-rate alerts, and an external blackbox_exporter uptime probe on `GET /health`. CloudWatch alarms cover Lambda errors and throttles and API Gateway 5XX and p95 latency. Each chat response also includes per-stage timings and token usage. See [monitoring/README.md](monitoring/README.md).
 
 ## Repository layout
 
@@ -33,6 +33,7 @@ lambda_ingest/     POST /ingest handler
 lambda_chat/       POST /chat handler
 infrastructure/    AWS CDK stack (TypeScript)
 chat_ui/           Static web interface
+monitoring/        OTel Collector, Prometheus SLO rules, Grafana dashboards, Alertmanager, blackbox_exporter
 eval/              Retrieval evaluation (metrics, runner, eval-set template)
 tests/             Unit tests (run offline, no AWS needed)
 scripts/           Lambda layer build script
@@ -56,7 +57,10 @@ Optional settings are passed as CDK context:
 | --- | --- | --- |
 | `allowedOrigin` | `*` | CORS origin, e.g. your Chat UI URL |
 | `throttleRate` / `throttleBurst` | `5` / `10` | API Gateway requests per second and burst |
-| `uiRepoUrl` | this repo | Git repo the Chat UI instance clones |
+| `uiRepoUrl` | this repo | Git repo the Chat UI and monitoring instances clone |
+| `monitoring` | `false` | `true` adds the Prometheus/Grafana monitoring instance (see [monitoring/README.md](monitoring/README.md)) |
+| `monitoringAllowedCidr` | none | CIDR allowed to open Grafana on port 3000; unset means Session Manager only |
+| `alarmEmail` | none | Email subscribed to CloudWatch alarm notifications |
 
 ```bash
 ./deploy.sh -c allowedOrigin=http://ec2-1-2-3-4.compute-1.amazonaws.com
@@ -86,6 +90,10 @@ curl -X POST "$API/ingest" -H "Content-Type: application/json" \
 | `topic_name` | no | defaults to the query in title case |
 
 Returns `inserted_count`, `skipped_duplicates`, `failed_count`, `elapsed_ms`, and the list of fetched papers.
+
+### `GET /health`
+
+Runs `SELECT 1` through API Gateway, Lambda and the database. Returns `{"status": "ok"}` or a 503. Used by the uptime probe.
 
 ### `POST /chat`
 

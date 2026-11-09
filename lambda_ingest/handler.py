@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 from common.db_utils import get_or_create_topic, initialize_database, insert_paper, paper_exists
 from common.http_utils import BadRequest, clamp_int, parse_body, require_text, response, server_error
+from common import telemetry
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -62,6 +63,7 @@ def fetch_arxiv_papers(query: str, max_results: int = 10) -> List[Dict[str, Any]
         return parse_arxiv_response(resp.read().decode("utf-8"))
 
 
+@telemetry.instrumented("/ingest")
 def main(event, context):
     """
     POST /ingest

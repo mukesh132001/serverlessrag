@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from common.bedrock_utils import generate_chat_response, generate_embeddings
 from common.db_utils import execute_query, to_pgvector
 from common.http_utils import BadRequest, clamp_int, parse_body, require_text, response, server_error
+from common import telemetry
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -15,8 +16,10 @@ MAX_TOP_K = 20
 NO_RESULTS_MESSAGE = "I could not find relevant information to answer your query."
 
 
+@telemetry.instrumented("/chat")
 def main(event, context):
     """
+    GET /health  -> health_check()
     POST /chat
     {
         "query": "What are recent advances in quantum error correction?",
@@ -25,6 +28,9 @@ def main(event, context):
         "retrieval_only": false         # optional; skip the LLM call (used by evaluation)
     }
     """
+    if isinstance(event, dict) and event.get("resource") == "/health":
+        return health_check(context)
+
     started = time.perf_counter()
     try:
         body = parse_body(event)
@@ -77,6 +83,8 @@ def main(event, context):
             timings["generation_ms"] = _ms_since(t)
 
         timings["total_ms"] = _ms_since(started)
+        telemetry.record_stages("/chat", timings)
+        telemetry.record_tokens(usage)
         logger.info("chat ok top_k=%s sources=%s timings=%s usage=%s", top_k, len(sources), timings, usage)
 
         return response(200, {
@@ -89,6 +97,20 @@ def main(event, context):
     except Exception:
         logger.exception("Error in chat handler")
         return server_error(context)
+
+
+def health_check(context):
+    """GET /health: API Gateway -> Lambda -> database round trip, no Bedrock cost.
+
+    Target of the external blackbox_exporter uptime probe.
+    """
+    t = time.perf_counter()
+    try:
+        execute_query("SELECT 1", fetch=True)
+    except Exception:
+        logger.exception("health check: database unreachable")
+        return response(503, {"status": "unhealthy", "database": "unreachable"})
+    return response(200, {"status": "ok", "database": "ok", "db_ms": _ms_since(t)})
 
 
 def build_search_query(topic_id: Optional[int]) -> str:

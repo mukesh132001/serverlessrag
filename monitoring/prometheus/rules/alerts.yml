@@ -1,0 +1,45 @@
+# Non-SLO alerts: external uptime probe and the telemetry pipeline itself.
+groups:
+- name: uptime
+  rules:
+  - alert: EndpointDown
+    # blackbox_exporter probes GET /health from outside the request path.
+    expr: probe_success{job="blackbox-health"} == 0
+    for: 2m
+    labels:
+      severity: page
+    annotations:
+      summary: "Uptime probe failing for {{ $labels.instance }}"
+      description: "blackbox_exporter has not received a 200 with status ok from {{ $labels.instance }} for 2 minutes."
+  - alert: EndpointSlow
+    expr: avg_over_time(probe_duration_seconds{job="blackbox-health"}[10m]) > 2
+    for: 10m
+    labels:
+      severity: ticket
+    annotations:
+      summary: "Health probe to {{ $labels.instance }} averaging {{ $value | humanizeDuration }}"
+  - alert: TLSCertExpiringSoon
+    expr: (probe_ssl_earliest_cert_expiry{job="blackbox-health"} - time()) < 14 * 86400
+    for: 1h
+    labels:
+      severity: ticket
+    annotations:
+      summary: "TLS certificate for {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"
+
+- name: telemetry-pipeline
+  rules:
+  - alert: OtelCollectorDown
+    expr: up{job="otel-collector"} == 0
+    for: 5m
+    labels:
+      severity: ticket
+    annotations:
+      summary: "OpenTelemetry Collector is not being scraped; SLO metrics are blind"
+  - alert: OtelExportFailures
+    # Collector rejected or failed to process incoming OTLP metric points.
+    expr: sum(rate(otelcol_receiver_refused_metric_points_total[10m])) > 0
+    for: 10m
+    labels:
+      severity: ticket
+    annotations:
+      summary: "OpenTelemetry Collector is refusing metric points"

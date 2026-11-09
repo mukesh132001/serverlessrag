@@ -1,0 +1,5 @@
+# Copy to blackbox.yml (setup.sh does this for you) with your API Gateway URL.
+- targets:
+    - https://abc123.execute-api.us-east-1.amazonaws.com/prod/health
+  labels:
+    service: serverlessrag-api
